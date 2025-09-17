@@ -1,8 +1,8 @@
 """
-Streamlit 대시보드 (한국어 UI)
+Streamlit 폭염 데이터 대시보드
 - 공식 공개 데이터: NASA GISTEMP (글로벌 기온 이상값 CSV)
-  출처: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
-- 사용자 입력 대시보드: 폭염 관련 학생 글
+  URL: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+- 사용자 입력 글 제거, 폭염 중심 시각화
 """
 
 import streamlit as st
@@ -13,12 +13,26 @@ import io
 from datetime import datetime, timezone, timedelta
 import plotly.express as px
 
-st.set_page_config(page_title="폭염 & 교실 영향 대시보드", layout="wide")
+st.set_page_config(page_title="폭염 데이터 대시보드", layout="wide")
 
-st.title("🌡️ 폭염과 교실 — 공개 데이터 + 학생 관점")
-st.caption("공식 공개 데이터로 분석하고, 아래에 제공된 학생 글 기반 인사이트를 표시합니다.")
+# Pretendard 폰트 적용 시도
+PRETENDARD_PATH = "/fonts/Pretendard-Bold.ttf"
+css_font = f"""
+<style>
+@font-face {{
+  font-family: 'PretendardCustom';
+  src: url('{PRETENDARD_PATH}');
+}}
+html, body, [class*="css"]  {{
+  font-family: PretendardCustom, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+}}
+</style>
+"""
+st.markdown(css_font, unsafe_allow_html=True)
 
-# ----- 유틸: 오늘(로컬 자정) 계산 (Asia/Seoul) -----
+st.title("🌡️ 폭염 데이터 대시보드")
+
+# 오늘(로컬 자정) 계산 (Asia/Seoul)
 def local_midnight_today():
     tz_offset = 9
     now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -28,7 +42,9 @@ def local_midnight_today():
 
 LOCAL_MIDNIGHT_UTC = local_midnight_today()
 
-# ----- NASA GISTEMP 데이터 로드 -----
+# ---------------------------
+# NASA GISTEMP 데이터 로드
+# ---------------------------
 GISTEMP_CSV_URL = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
 
 @st.cache_data(ttl=60*60*6, show_spinner=False)
@@ -78,86 +94,40 @@ def load_gistemp(url=GISTEMP_CSV_URL, timeout=10):
         })
         return {"ok": False, "df": ex_df, "error": str(e), "source": url}
 
-# ----- 공개 데이터 UI -----
+# ---------------------------
+# 공개 데이터 UI
+# ---------------------------
 load_result = load_gistemp()
 if not load_result["ok"]:
-    st.warning("공개 데이터(GISTEMP) 다운로드 실패 → 예시 데이터 사용\n오류: " + load_result.get("error", "알 수 없음"))
+    st.warning("공개 데이터 다운로드 실패 → 예시 데이터 사용\n오류: " + load_result.get("error","알 수 없음"))
 gistemp_df = load_result["df"]
 
 st.subheader("NASA GISTEMP — 기온 이상값 시계열")
-col1, col2 = st.columns([3,1])
-with col2:
-    rolling = st.selectbox("스무딩(개월)", [1,3,6,12], index=1)
-    viz_type = st.selectbox("그래프 유형", ["꺾은선","면적"], index=0)
-with col1:
-    df_plot = gistemp_df.copy()
-    if rolling > 1:
-        df_plot['value_sm'] = df_plot['value'].rolling(window=rolling, min_periods=1).mean()
-        y_col = 'value_sm'
-    else:
-        y_col = 'value'
 
-    df_plot = df_plot.groupby('date', as_index=False)[y_col].mean()
-    if viz_type=="꺾은선":
-        fig = px.line(df_plot, x='date', y=y_col,
-                      labels={'date':'날짜', y_col:'이상값(°C)'})
-    else:
-        fig = px.area(df_plot, x='date', y=y_col,
-                      labels={'date':'날짜', y_col:'이상값(°C)'})
-    st.plotly_chart(fig, use_container_width=True)
+# 연도/개월 선택
+years = sorted(gistemp_df['date'].dt.year.unique())
+selected_years = st.multiselect("연도 선택", years, default=[years[-5], years[-4], years[-3], years[-2], years[-1]] if len(years)>=5 else years)
+
+df_plot = gistemp_df[gistemp_df['date'].dt.year.isin(selected_years)].copy()
+
+rolling = st.selectbox("스무딩(개월)", [1,3,6,12], index=1)
+viz_type = st.selectbox("그래프 유형", ["꺾은선","면적"], index=0)
+
+if rolling > 1:
+    df_plot['value_sm'] = df_plot['value'].rolling(window=rolling, min_periods=1).mean()
+    y_col = 'value_sm'
+else:
+    y_col = 'value'
+
+# 날짜별 평균 (중복 월 제거)
+df_plot = df_plot.groupby('date', as_index=False)[y_col].mean()
+
+if viz_type=="꺾은선":
+    fig = px.line(df_plot, x='date', y=y_col, labels={'date':'날짜','value':'이상값(°C)'})
+else:
+    fig = px.area(df_plot, x='date', y=y_col, labels={'date':'날짜','value':'이상값(°C)'})
+
+st.plotly_chart(fig, use_container_width=True)
 
 st.download_button("CSV 다운로드", gistemp_df.to_csv(index=False).encode('utf-8'),
                    file_name="gistemp_preprocessed.csv", mime="text/csv")
-
-# ----- 사용자 입력 대시보드 -----
-st.markdown("---")
-st.header("사용자 입력: 폭염 관련 학생 글")
-
-USER_TEXT = """
-최근 몇 년간 여름이 점점 더 길어지고, 폭염일수도 증가하고 있다. 
-우리 교실은 햇볕이 강하게 드는 창가 쪽부터 온도가 급격히 올라가고, 점심시간 이후에는 공기가 답답하고 무거워진다. 
-체육이나 야외 활동을 할 때는 열사병 위험까지 걱정해야 한다. 
-교실 내 에어컨이 있더라도 일부만 시원하고, 학생들의 집중력은 떨어지며, 두통이나 피로가 쉽게 쌓인다. 
-폭염이 단순한 불편함이 아니라 학습권과 건강권에 직접적인 영향을 주는 상황인 것이다. 
-교실 환경 개선과 적절한 대응이 필요한 이유가 바로 여기에 있다.
-"""
-USER_LINK = "https://www.kma.go.kr/weather/climate/heatwave"
-
-st.write(USER_TEXT)
-st.markdown(f"출처: {USER_LINK}")
-
-# 키워드 빈도 분석
-st.subheader("텍스트 기반 인사이트 — 키워드 빈도 분석")
-def simple_keyword_counts(text, keywords=None):
-    if keywords is None:
-        keywords = ['폭염','교실','학생','학습권','건강','창가','점심','체육','에어컨','두통','피로','환경']
-    lowered = text.replace('\n',' ').lower()
-    counts = {k: lowered.count(k) for k in keywords}
-    dfk = pd.DataFrame({"키워드":list(counts.keys()), "빈도":list(counts.values())})
-    dfk = dfk.sort_values('빈도', ascending=False).reset_index(drop=True)
-    return dfk
-
-kw_df = simple_keyword_counts(USER_TEXT)
-fig_kw = px.bar(kw_df, x='키워드', y='빈도', title="키워드 빈도 (간단 카운트)", labels={'빈도':'빈도수','키워드':'키워드'})
-st.plotly_chart(fig_kw, use_container_width=True)
-
-# 간단 요약
-st.subheader("간단 요약 (자동 생성)")
-lines = [ln.strip() for ln in USER_TEXT.strip().split('\n') if ln.strip()]
-summary = ""
-if lines:
-    summary = lines[0]
-    if len(lines) > 1:
-        summary += " ... " + lines[-1]
-st.info(summary)
-
-# 사용자 입력 전처리 표 다운로드
-st.subheader("사용자 입력 전처리 표 (다운로드)")
-user_table = pd.DataFrame({
-    '원문구분':['본문'],
-    '텍스트길이': [len(USER_TEXT)],
-    '주요키워드': [", ".join(kw_df[kw_df['빈도']>0]['키워드'].tolist())],
-    '출처링크':[USER_LINK]
-})
-st.dataframe(user_table)
-st.download_button("사용자 입력 전처리 CSV 다운로드", data=user_table.to_csv(index=False).encode('utf-8'), file_name='user_input_preprocessed.csv', mime='text/csv')
