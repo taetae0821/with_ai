@@ -1,6 +1,11 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np  # 맨 위에 추가
+
+# 예시 데이터
+temperatures = 25 + (dates.year - 2015) * 0.3 + pd.Series(np.random.randn(len(dates)))
+
 
 st.set_page_config(page_title="폭염 대시보드", layout="wide")
 st.title("폭염 대시보드")
