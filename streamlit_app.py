@@ -16,7 +16,7 @@ dates = pd.date_range(start="2015-01-01", end="2025-12-31", freq='M')
 dates = pd.to_datetime(dates)
 
 # 온도 생성: 연도 증가에 따라 조금씩 상승 + 랜덤 노이즈
-temperatures = 25 + (dates.dt.year - 2015) * 0.3 + np.random.randn(len(dates))
+temperatures = 25 + (dates.year - 2015) * 0.3 + np.random.randn(len(dates))
 
 df = pd.DataFrame({
     'date': dates,
