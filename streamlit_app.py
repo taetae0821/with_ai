@@ -1,347 +1,264 @@
 # streamlit_app.py
-# Streamlit 앱 — 한국어 UI
-# 주요 공개 데이터(예시): NOAA / NASA / World Bank 등
-# 출처(예시, 코드 주석에 남김):
-# NOAA Global Temperature anomalies: https://www.ncei.noaa.gov/access/monitoring/global-temperature-anomalies/
-# NASA GISTEMP: https://data.giss.nasa.gov/gistemp/
-# World Bank CO2 (kt): http://api.worldbank.org/v2/en/indicator/EN.ATM.CO2E.KT?downloadformat=csv
-# (kaggle 사용 시) kaggle API 인증 안내: https://www.kaggle.com/docs/api
+"""
+Streamlit 대시보드 (한국어 UI)
+- 공식 공개 데이터 대시보드: NASA GISTEMP (글로벌 기온 이상값 CSV)
+  출처(코드 주석에 명시)
+  - https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+- 사용자 입력 대시보드: 사용자가 제공한 '설명 텍스트' + 링크를 기반으로 간단한 텍스트 기반 인사이트 및 시각화
+요구사항 요약:
+- 한국어 UI
+- 오늘(로컬 자정) 이후 데이터 제거
+- API/다운로드 실패 시 예시 데이터로 자동 대체 (화면에 안내)
+- 전처리: 결측 처리 / 형변환 / 중복 제거 / 미래데이터 제거
+- 캐시: @st.cache_data 사용
+- 전처리된 표를 CSV 다운로드 버튼으로 제공
+- Pretendard 폰트 시도: /fonts/Pretendard-Bold.ttf (없으면 자동 생략)
+"""
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from io import BytesIO, StringIO
+import io
+from datetime import datetime, timezone, timedelta
 import plotly.express as px
-import matplotlib.pyplot as plt
-from datetime import datetime, timezone
-import time
-import os
 
-st.set_page_config(page_title="데이터 대시보드 (Streamlit + Codespaces)", layout="wide")
+st.set_page_config(page_title="폭염 & 교실 영향 대시보드", layout="wide")
 
-# -----------------------
-# 유틸리티: 한국어 날짜/형식
-# -----------------------
-def now_seoul():
-    # 로컬 타임존이 아닌 환경에서도 UTC를 기반으로 현재 시각을 얻은 후 한국 시간으로 변환
-    return datetime.utcnow().astimezone().astimezone()
-
-def drop_future_dates(df, date_col='date'):
-    if date_col not in df.columns:
-        return df
-    try:
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        cutoff = pd.to_datetime(datetime.utcnow())
-        return df[df[date_col] <= cutoff].copy()
-    except Exception:
-        return df
-
-# -----------------------
-# 폰트 적용 시도 (Pretendard)
-# -----------------------
+# ----- Pretendard 적용 시도 (있으면 사용, 없으면 무시) -----
 PRETENDARD_PATH = "/fonts/Pretendard-Bold.ttf"
-def try_apply_pretendard():
-    # matplotlib
-    try:
-        if os.path.exists(PRETENDARD_PATH):
-            import matplotlib.font_manager as fm
-            fm.fontManager.addfont(PRETENDARD_PATH)
-            prop = fm.FontProperties(fname=PRETENDARD_PATH)
-            plt.rcParams['font.family'] = prop.get_name()
-    except Exception:
-        pass
+css_font = f"""
+<style>
+@font-face {{
+  font-family: 'PretendardCustom';
+  src: url('{PRETENDARD_PATH}');
+}}
+html, body, [class*="css"]  {{
+  font-family: PretendardCustom, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+}}
+</style>
+"""
+st.markdown(css_font, unsafe_allow_html=True)
 
-    # plotly: set default font family in layouts later per-figure
-    # streamlit itself will inherit system fonts; can't guarantee Pretendard but attempt to reference it in CSS
-    try:
-        if os.path.exists(PRETENDARD_PATH):
-            st.markdown(
-                f"""
-                <style>
-                @font-face {{
-                    font-family: 'PretendardCustom';
-                    src: url('{PRETENDARD_PATH}') format('truetype');
-                }}
-                html, body, .css-1d391kg, .stApp {{
-                    font-family: PretendardCustom, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans KR', 'Helvetica', 'Arial', sans-serif;
-                }}
-                </style>
-                """,
-                unsafe_allow_html=True,
-            )
-    except Exception:
-        pass
+st.title("🌡️ 폭염과 교실 — 공개 데이터 + 사용자 입력 대시보드")
+st.caption("공식 공개 데이터로 먼저 분석하고, 아래에 제공된 사용자 입력 텍스트를 별도 대시보드로 보여줍니다.")
 
-try_apply_pretendard()
+# ---------------------------
+# 유틸: 오늘(로컬 자정) 계산 (Asia/Seoul)
+# ---------------------------
+def local_midnight_today():
+    # Asia/Seoul is UTC+9
+    tz_offset = 9
+    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    local_now = now_utc + timedelta(hours=tz_offset)
+    local_midnight = datetime(year=local_now.year, month=local_now.month, day=local_now.day)
+    # convert to UTC-aware
+    return local_midnight - timedelta(hours=tz_offset)
 
-# -----------------------
-# 캐시 및 재시도 유틸리티
-# -----------------------
-MAX_RETRIES = 3
-RETRY_DELAY = 1.0
+LOCAL_MIDNIGHT_UTC = local_midnight_today()
 
-@st.cache_data(show_spinner=False)
-def fetch_with_retries(url, params=None, headers=None, as_bytes=False, timeout=15):
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            return resp.content if as_bytes else resp.text
-        except Exception as e:
-            last_exc = e
-            time.sleep(RETRY_DELAY * attempt)
-    # 재시도 실패 시 예외 전달
-    raise last_exc
+# ---------------------------
+# 공개 데이터: NASA GISTEMP 가져오기
+# ---------------------------
+GISTEMP_CSV_URL = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
 
-# -----------------------
-# 공개 데이터 불러오기 (예시: NOAA global temp anomalies + World Bank CO2)
-# - 실패 시 예시 데이터로 대체하고 사용자에게 안내
-# -----------------------
-def load_public_noaa():
+@st.cache_data(ttl=60*60*6, show_spinner=False)
+def load_gistemp(url=GISTEMP_CSV_URL, timeout=10):
     """
-    NOAA (예시)에서 월별 전지구 온도 편차 데이터를 시도해서 불러옵니다.
-    (실제 서비스 URL은 변경될 수 있음 — 실행 환경에서 접속 실패하면 예시 데이터로 대체됩니다.)
-    출처 예시:
-      https://www.ncei.noaa.gov/access/monitoring/global-temperature-anomalies/
+    시도 순서:
+    1) 원본 CSV 요청
+    2) 실패하면 예시 데이터를 반환 (그리고 플래그로 실패 알림)
     """
-    # 예시 URL (직접 CSV 링크가 바뀔 수 있으므로 실패 대비)
-    # 여기서는 공개 데이터를 얻기 위한 시도용 URL을 명시합니다.
-    url = "https://www.ncei.noaa.gov/access/monitoring/global-temperature-anomalies/monthly.csv"
     try:
-        txt = fetch_with_retries(url, as_bytes=False)
-        # 데이터 파싱 (예상 포맷: 연-월, anomaly)
-        df = pd.read_csv(StringIO(txt))
-        # 표준화: date, value, group(optional)
-        # 사용자 데이터 형식이 다양할 수 있으므로 안전하게 변환
-        if 'Date' in df.columns:
-            df = df.rename(columns={'Date':'date'})
-        if 'Value' in df.columns:
-            df = df.rename(columns={'Value':'value'})
-        # try to find a column with 'anomaly' or 'temp'
-        for col in df.columns:
-            if 'anom' in col.lower() or 'temp' in col.lower():
-                df = df.rename(columns={col:'value'})
-                break
-        if 'date' not in df.columns:
-            # try to combine Year & Month
-            if {'Year','Month'}.issubset(df.columns):
-                df['date'] = pd.to_datetime(df['Year'].astype(str) + '-' + df['Month'].astype(str) + '-01', errors='coerce')
-        df = df[['date','value']].copy()
-        df = df.dropna(subset=['date'])
-        df = drop_future_dates(df, 'date')
-        return df, None
-    except Exception as e:
-        # 실패 시 예시 데이터 생성
-        dates = pd.date_range(end=pd.Timestamp.utcnow(), periods=240, freq='M')
-        np.random.seed(0)
-        anomalies = np.cumsum(np.random.normal(0.01, 0.05, size=len(dates)))  # fake trend
-        sample = pd.DataFrame({'date':dates, 'value':anomalies})
-        msg = "공개 데이터(예: NOAA) 불러오기에 실패하여 예시 데이터를 사용합니다."
-        return sample, msg
-
-def load_public_co2_worldbank():
-    """
-    World Bank CO2 indicator 예시를 시도해서 불러옵니다.
-    출처 예시:
-      http://api.worldbank.org/v2/en/indicator/EN.ATM.CO2E.KT?downloadformat=csv
-    """
-    # World Bank 직접 API (CSV 다운로드가 zip일 수 있음). 여기서는 간편화.
-    url = "http://api.worldbank.org/v2/country/all/indicator/EN.ATM.CO2E.KT?format=json&per_page=10000"
-    try:
-        txt = fetch_with_retries(url, as_bytes=False)
-        data = pd.read_json(StringIO(txt))
-        # World Bank JSON 구조: [metadata, [records...]]
-        if isinstance(data, list) and len(data) >= 2:
-            records = pd.DataFrame(data[1])
-            # 표준화
-            if 'date' in records.columns and 'value' in records.columns:
-                df = records[['date','value']].copy()
-                df['date'] = pd.to_datetime(df['date'], format='%Y', errors='coerce')
-                df = drop_future_dates(df, 'date')
-                return df, None
-        raise ValueError("World Bank 포맷 예외")
-    except Exception as e:
-        years = np.arange(1980, pd.Timestamp.utcnow().year+1)
-        vals = np.linspace(1000000, 1500000, len(years)) + np.random.normal(0, 50000, len(years))
-        sample = pd.DataFrame({'date':pd.to_datetime(years, format='%Y'), 'value':vals})
-        msg = "공개 데이터(예: World Bank CO2) 불러오기에 실패하여 예시 데이터를 사용합니다."
-        return sample, msg
-
-# -----------------------
-# 공개 데이터 대시보드 렌더링
-# -----------------------
-def public_dashboard():
-    st.header("공식 공개 데이터 대시보드")
-    col1, col2 = st.columns([2,1])
-    with col1:
-        st.subheader("전지구 평균 표면 온도 편차 (월별) — NOAA 예시")
-        df_temp, msg_temp = load_public_noaa()
-        if msg_temp:
-            st.warning(msg_temp)
-        df_temp = df_temp.sort_values('date')
-        # 전처리: 결측/중복/형변환
-        df_temp = df_temp.drop_duplicates()
-        df_temp['value'] = pd.to_numeric(df_temp['value'], errors='coerce')
-        df_temp = df_temp.dropna(subset=['value'])
-        st.write("데이터 미리보기 (최대 10개)", df_temp.head(10))
-
-        # 사이드바 옵션 자동 구성
-        st.sidebar.markdown("### 공용 데이터 옵션")
-        # 기간 필터
-        min_date = df_temp['date'].min()
-        max_date = df_temp['date'].max()
-        start, end = st.sidebar.date_input("기간 필터 (공개 데이터: 온도)", [min_date.date(), max_date.date()])
-        # 스무딩 옵션
-        smoothing = st.sidebar.slider("스무딩 이동평균(개월)", min_value=1, max_value=24, value=3)
-        # 단위 변환(온도 anomaly는 보통 °C)
-        unit_label = "°C (Anomaly)"
-
-        # 필터 적용
-        mask = (df_temp['date'] >= pd.to_datetime(start)) & (df_temp['date'] <= pd.to_datetime(end))
-        df_temp_plot = df_temp.loc[mask].copy()
-        if smoothing > 1:
-            df_temp_plot['smoothed'] = df_temp_plot['value'].rolling(window=smoothing, min_periods=1).mean()
-            y = 'smoothed'
-            legend = f"이동평균({smoothing}개월)"
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        # 서버가 CSV-like 텍스트로 제공 -> 읽기
+        text = resp.text
+        # NASA GISTEMP 파일은 앞에 주석/빈행이 적을 수 있으므로 pandas.read_csv with skiprows heuristic
+        # 하지만 file often begins with header "Land-Ocean: Global Means Year,Jan,Feb,..."
+        df = pd.read_csv(io.StringIO(text), comment='#')
+        # Clean: sometimes trailing columns like '***' exist; keep Year and months and J-D
+        # We'll keep Year and monthly columns (Jan..Dec) and J-D (annual)
+        needed_cols = [c for c in df.columns if c.strip() != ""]
+        df = df.loc[:, needed_cols]
+        # Rename Year column to 'Year' if needed
+        if 'Year' not in df.columns and df.columns[0].lower().startswith('land'):
+            # sometimes the first column header is like 'Land-Ocean: Global Means Year'
+            # so try to split
+            new_cols = df.columns.tolist()
+            # last token likely 'Year' in header string - try to fix:
+            # fallback: set first column name to 'Year'
+            df = df.rename(columns={df.columns[0]: 'Year'})
+        # Keep Year and J-D (annual)
+        # If monthly columns present, melt to monthly timeseries
+        # Identify month columns names (Jan..Dec)
+        month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+        available_months = [m for m in month_names if m in df.columns]
+        if available_months:
+            # melt to long format
+            df_melt = df.melt(id_vars=['Year'], value_vars=available_months, var_name='month', value_name='anom')
+            # Create date: Year-month-01
+            df_melt['Year'] = df_melt['Year'].astype(int)
+            month_num = {m:i+1 for i,m in enumerate(month_names)}
+            df_melt['month_num'] = df_melt['month'].map(month_num)
+            df_melt['date'] = pd.to_datetime(df_melt['Year']*10000 + df_melt['month_num']*100 + 1, format='%Y%m%d')
+            # Convert anomalous formats like '.12' or '-.12' -> numeric
+            df_melt['anom'] = pd.to_numeric(df_melt['anom'].astype(str).str.replace('*',''), errors='coerce')
+            df_final = df_melt[['date','anom']].sort_values('date').reset_index(drop=True)
+            df_final = df_final.rename(columns={'anom':'value'})
+            df_final['group'] = 'GISTEMP월별'
         else:
-            y = 'value'
-            legend = "원본"
+            # fallback: use J-D column if exists (annual)
+            if 'J-D' in df.columns:
+                df2 = df[['Year','J-D']].copy()
+                df2 = df2.rename(columns={'Year':'year','J-D':'value'})
+                df2['date'] = pd.to_datetime(df2['year'].astype(int).astype(str) + '-01-01')
+                df_final = df2[['date','value']].sort_values('date').reset_index(drop=True)
+                df_final['group'] = 'GISTEMP연간'
+            else:
+                raise ValueError("GISTEMP 파일 포맷을 해석할 수 없음.")
+        # 전처리: 결측 처리(보간 아님 — 결측 유지), 중복 제거, 형변환
+        df_final = df_final.drop_duplicates(subset=['date'])
+        df_final['value'] = pd.to_numeric(df_final['value'], errors='coerce')
+        # 미래 데이터 제거: remove rows with date >= local midnight (UTC)
+        df_final = df_final[df_final['date'] < LOCAL_MIDNIGHT_UTC]
+        df_final = df_final.reset_index(drop=True)
+        return {"ok": True, "df": df_final, "source": url}
+    except Exception as e:
+        # 예시 데이터 (간단한 월별 예시) — 사용자에게 실패를 UI에 알릴 것
+        example_dates = pd.date_range(end=(LOCAL_MIDNIGHT_UTC - pd.Timedelta(days=1)), periods=60, freq='M')
+        ex_df = pd.DataFrame({
+            'date': example_dates,
+            'value': np.linspace(0.2, 1.2, len(example_dates)) + np.random.normal(scale=0.05, size=len(example_dates)),
+            'group': '예시_GISTEMP'
+        })
+        return {"ok": False, "df": ex_df, "error": str(e), "source": url}
 
-        fig = px.line(df_temp_plot, x='date', y=y, title=f"전지구 평균 표면 온도 편차 ({unit_label})",
-                      labels={'date':'날짜','smoothed':'온도(이동평균)','value':'온도(원본)'},
-                      template='plotly_white')
-        fig.update_layout(font_family="PretendardCustom, 'Noto Sans KR', sans-serif")
-        st.plotly_chart(fig, use_container_width=True)
+# ----- 로드 및 UI 표시 -----
+with st.expander("공개 데이터: NASA GISTEMP (글로벌 기온 이상값) 불러오기 · 설명", expanded=True):
+    st.write("데이터 소스: NASA GISS GISTEMP (GLB.Ts+dSST). 월별 또는 연별 이상값을 사용합니다.")
+    st.markdown("- 원본 URL: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv")
+    st.markdown("- 처리 규칙: 결측 처리 / 중복 제거 / '오늘(로컬 자정) 이후' 데이터 제거")
+    st.markdown("- 실패 시: 예시 데이터로 자동 대체 (화면에 안내 표시)")
 
-        # CSV 다운로드
-        csv_buf = df_temp_plot.to_csv(index=False).encode('utf-8')
-        st.download_button("전처리된 공개 데이터 CSV 다운로드", data=csv_buf, file_name="public_temp_preprocessed.csv", mime="text/csv")
+load_result = load_gistemp()
 
-    with col2:
-        st.subheader("연간 국가별 CO₂ 배출(예시: World Bank)")
-        df_co2, msg_co2 = load_public_co2_worldbank()
-        if msg_co2:
-            st.warning(msg_co2)
-        df_co2 = df_co2.drop_duplicates()
-        df_co2['value'] = pd.to_numeric(df_co2['value'], errors='coerce')
-        df_co2 = df_co2.dropna(subset=['value'])
-        # 간단 시각화: 연도별 합계 (예시 데이터가 국가별이면 집계 처리 필요 — 여기선 이미 연단위 집계 예시로 가정)
-        df_co2 = df_co2.sort_values('date')
-        st.write("데이터 미리보기 (최대 10개)", df_co2.head(10))
+if not load_result["ok"]:
+    st.warning("공개 데이터(GISTEMP) 다운로드에 문제가 발생했습니다. 예시 데이터로 대체합니다.\n오류: " + load_result.get("error", "알 수 없는 오류"))
+gistemp_df = load_result["df"]
 
-        # 연도 선택
-        years = df_co2['date'].dt.year.unique()
-        sel_year = st.selectbox("연도 선택 (CO₂)", options=sorted(years)[-10:], index=len(sorted(years)) - 1)
-        df_year = df_co2[df_co2['date'].dt.year == int(sel_year)]
-        if df_year.empty:
-            st.info("선택한 연도의 데이터가 없습니다.")
-        else:
-            fig2 = px.bar(df_year, x='date', y='value', title=f"{sel_year}년 CO₂ (단위: kt)",
-                          labels={'date':'연도','value':'CO₂ (kt)'}, template='plotly_white')
-            fig2.update_layout(font_family="PretendardCustom, 'Noto Sans KR', sans-serif")
-            st.plotly_chart(fig2, use_container_width=True)
-            csv_buf2 = df_year.to_csv(index=False).encode('utf-8')
-            st.download_button("선택 연도 CO₂ CSV 다운로드", data=csv_buf2, file_name=f"co2_{sel_year}.csv", mime="text/csv")
+# 상단 요약카드
+col1, col2, col3 = st.columns([2,2,2])
+with col1:
+    st.metric("데이터 기간 (시작)", gistemp_df['date'].min().strftime("%Y-%m-%d"))
+with col2:
+    st.metric("데이터 기간 (끝)", gistemp_df['date'].max().strftime("%Y-%m-%d"))
+with col3:
+    st.metric("샘플 수", f"{len(gistemp_df):,}")
 
-    st.markdown("---")
-    st.markdown("**설명:** 먼저 공식 공개 데이터를 불러와 기본적인 전처리(결측, 형변환, 미래 데이터 제거)를 수행합니다. 데이터 소스가 변경되거나 접근 불가하면 예시 데이터로 대체됩니다.")
-
-# -----------------------
-# 사용자 입력 대시보드
-# - 원칙: 입력 섹션에 제공된 자료만 사용. (현재 프롬프트로 받은 input 없음 -> 예시 알림 및 내장 샘플 사용)
-# - 앱 실행 중 파일 업로드/텍스트 요구 금지
-# -----------------------
-def user_input_dashboard():
-    st.header("사용자 입력 기반 대시보드")
-    st.info("참고: 현재 입력된 CSV/이미지/설명이 없습니다. (프롬프트의 Input 섹션 미제공) 예시 데이터를 사용하여 대시보드를 자동 생성합니다.")
-    # 여기는 '사용자가 제공한' 데이터만 사용해야 함. 입력이 없으므로 예시 데이터 사용 및 안내.
-    # 예시: 간단한 지역별 판매/측정치 CSV 포맷 (date, value, group)
-    dates = pd.date_range(end=pd.Timestamp.utcnow(), periods=36, freq='M')
-    groups = ['A','B','C']
-    rows = []
-    for g in groups:
-        vals = np.cumsum(np.random.normal(10, 5, size=len(dates))) + (0 if g=='A' else 50 if g=='B' else 100)
-        for d,v in zip(dates, vals):
-            rows.append({'date':d, 'value':v, 'group':g})
-    df_user = pd.DataFrame(rows)
-    # 표준화 및 전처리
-    df_user = df_user.drop_duplicates()
-    df_user['date'] = pd.to_datetime(df_user['date'], errors='coerce')
-    df_user = drop_future_dates(df_user, 'date')
-    df_user['value'] = pd.to_numeric(df_user['value'], errors='coerce')
-    df_user = df_user.dropna(subset=['date','value'])
-    st.write("사용자 입력(또는 예시) 데이터 미리보기", df_user.head(10))
-
-    # 자동으로 시각화 선택: 시계열 + 그룹 -> 꺾은선(그룹별)
-    st.subheader("시계열: 그룹별 추이")
-    smoothing = st.slider("스무딩 이동평균(기간)", min_value=1, max_value=12, value=3, key='user_smooth')
-    agg_df = df_user.sort_values('date').copy()
-    if smoothing > 1:
-        agg_df['value_sm'] = agg_df.groupby('group')['value'].transform(lambda x: x.rolling(window=smoothing, min_periods=1).mean())
+# 주요 시각화: 시계열 (꺾은선 + 면적 선택)
+st.subheader("공식 공개 데이터 대시보드 — 기온 이상값 시계열")
+colA, colB = st.columns([3,1])
+with colB:
+    st.write("옵션")
+    rolling = st.selectbox("스무딩 (이동평균 기간, 월 기준)", [1,3,6,12], index=1, help="값이 1이면 스무딩 없음")
+    viz_type = st.selectbox("그래프 유형", ["꺾은선", "면적(Area)"], index=0)
+    show_points = st.checkbox("데이터 점 표시", value=False)
+with colA:
+    df_plot = gistemp_df.copy()
+    if rolling and rolling > 1:
+        df_plot['value_sm'] = df_plot['value'].rolling(window=rolling, min_periods=1).mean()
         y_col = 'value_sm'
     else:
         y_col = 'value'
-    fig = px.line(agg_df, x='date', y=y_col, color='group', title="그룹별 시계열 추이",
-                  labels={'date':'날짜', y_col:'값'}, template='plotly_white')
-    fig.update_layout(font_family="PretendardCustom, 'Noto Sans KR', sans-serif")
+    title = "전지구 표면 온도 이상값 (NASA GISTEMP)"
+    fig = px.line(df_plot, x='date', y=y_col, title=title, labels={'date':'날짜','value':'이상값(°C)'})
+    if viz_type == "면적(Area)":
+        fig = px.area(df_plot, x='date', y=y_col, title=title, labels={'date':'날짜','value':'이상값(°C)'})
+    if show_points:
+        fig.update_traces(mode='lines+markers')
+    fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    # 비율 시각화: 최신 시점에서 그룹 비중 (원그래프)
-    st.subheader("비율: 최신 시점 그룹 비중")
-    latest_date = agg_df['date'].max()
-    df_latest = agg_df[agg_df['date'] == latest_date].groupby('group', as_index=False)[y_col].sum()
-    if not df_latest.empty:
-        fig2 = px.pie(df_latest, names='group', values=y_col, title=f"{latest_date.date()} 기준 그룹 비중",
-                      hole=0.35)
-        fig2.update_layout(font_family="PretendardCustom, 'Noto Sans KR', sans-serif")
-        st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("최근 시점 데이터가 없어 비율 차트를 표시할 수 없습니다.")
+# 테이블과 CSV 다운로드
+st.subheader("전처리된 표 (다운로드 가능)")
+st.dataframe(gistemp_df.head(100))
+csv_bytes = gistemp_df.to_csv(index=False).encode('utf-8')
+st.download_button("전처리된 데이터 CSV 다운로드", data=csv_bytes, file_name="gistemp_preprocessed.csv", mime="text/csv")
 
-    # 지도 시각화: 만약 group을 지역코드로 쓰면 지도 표시 (예시로 그룹->위치 매핑)
-    st.subheader("지역(그룹) 지도 시각화 (예시)")
-    # 예시 좌표 매핑
-    loc_map = {'A':(37.5665,126.9780), 'B':(35.1796,129.0756), 'C':(35.9078,127.7669)}
-    df_map = df_latest.copy()
-    df_map['lat'] = df_map['group'].map(lambda x: loc_map.get(x, (np.nan,np.nan))[0])
-    df_map['lon'] = df_map['group'].map(lambda x: loc_map.get(x, (np.nan,np.nan))[1])
-    df_map = df_map.dropna(subset=['lat','lon'])
-    if not df_map.empty:
-        st.map(df_map.rename(columns={y_col:'value'}))
-    else:
-        st.info("지도 표시를 위한 위치 데이터가 없습니다.")
+# ---------------------------
+# 사용자 입력 대시보드 (입력: 텍스트 + 링크)
+# ---------------------------
+st.markdown("---")
+st.header("사용자 입력 대시보드 (제공된 텍스트/링크 기반)")
 
-    # CSV 다운로드
-    st.download_button("사용자 입력(전처리된) CSV 다운로드", data=df_user.to_csv(index=False).encode('utf-8'), file_name="user_input_preprocessed.csv", mime="text/csv")
+# 사용자 입력 (프롬프트에서 제공된 텍스트와 링크을 하드코딩하여 앱 실행 중 추가 입력 요구하지 않음)
+USER_TEXT = """
+폭염의 가장 큰 피해자는 바로 매일 학교에서 생활하는 우리 학생들이다.
+창가 자리는 햇빛 때문에 찜통이 되고, 점심시간이 지나 나른해진 오후에는 교실 전체가 찜질방처럼 변한다. 이런 환경에서는 아무리 공부를 열심히 하려고 해도 집중력이 떨어지고, 머리가 아프거나 쉽게 피로해진다. 우리의 건강과 학습권이 폭염에 그대로 노출된 것이다.
+실제로 폭염경보가 내리는 날이면, 체육 시간은 운동장 대신 교실에서 이론 수업으로 대체되거나 아예 취소된다. 작년 여름방학 보충수업 기간에는 너무 더워서 단축 수업을 하기도 했다. 결국, 바다 온도 상승 → 내륙 폭염 증가 → 교실 온도 상승 → 우리의 학습권과 건강권 위협이라는 연쇄 고리가 우리 눈앞에서 벌어지고 있는 셈이다.
+따라서 끓는 교실의 온도를 낮추는 것은 단순히 더위를 피하는 문제가 아니라, 우리의 소중한 학습권을 지키기 위한 중요한 활동이다.
+"""
+USER_LINK = "https://nsp.nanet.go.kr/plan/subject/detail.do?newReportChk=list&nationalPlanControlNo=PLAN0000048033"
 
-# -----------------------
-# 메인
-# -----------------------
-def main():
-    st.title("Streamlit + GitHub Codespaces 데이터 대시보드 템플릿")
-    st.markdown("한국어 UI — 공개 데이터 먼저 불러온 뒤 사용자 입력(프롬프트 제공 데이터) 기반 대시보드를 생성합니다.")
-    st.sidebar.title("네비게이션")
-    page = st.sidebar.radio("페이지 선택", ["공개 데이터 대시보드", "사용자 입력 대시보드", "앱 정보"])
+st.subheader("원문 (사용자 제공)")
+st.write(USER_TEXT)
+st.markdown(f"**제공 링크:** {USER_LINK}")
 
-    if page == "공개 데이터 대시보드":
-        public_dashboard()
-    elif page == "사용자 입력 대시보드":
-        user_input_dashboard()
-    else:
-        st.header("앱 정보")
-        st.markdown("""
-        - 이 앱은 Streamlit + Codespaces 환경에서 즉시 실행 가능한 대시보드 템플릿입니다.
-        - 공개 데이터(예: NOAA, NASA, World Bank)를 먼저 시도해 불러오며, 실패 시 예시 데이터로 대체하고 화면에 안내합니다.
-        - 사용자 입력 데이터(프롬프트 Input 섹션으로 주어지는 CSV/이미지/설명)가 없으면 예시 데이터를 사용하여 대시보드를 자동 생성합니다.
-        - 모든 라벨·툴팁·버튼은 한국어로 작성되어 있습니다.
-        - 폰트는 /fonts/Pretendard-Bold.ttf 가 있으면 적용을 시도합니다.
-        - 캐싱: @st.cache_data 를 사용합니다.
-        - 전처리된 표는 CSV 다운로드 버튼으로 제공합니다.
-        """)
-        st.markdown("**주의:** 실제 공개 데이터 API는 포맷이나 URL이 바뀔 수 있습니다. 운영 환경에서는 데이터 공급자의 최신 API 문서를 참고해 URL과 파싱 로직을 업데이트하세요.")
-        st.markdown("Kaggle 데이터 사용 안내(선택적): Kaggle API를 사용하려면 kaggle.json(Username/Key)을 Codespaces의 안전한 위치(~/.kaggle/kaggle.json)에 두고, `pip install kaggle` 후 `kaggle datasets download` 또는 `kaggle competitions download` 명령을 사용하세요. 자세한 내용: https://www.kaggle.com/docs/api")
+# 텍스트 기반 간단한 자연어 분석 (키워드 빈도)
+st.subheader("텍스트 기반 인사이트 — 키워드 빈도 분석")
 
-if __name__ == "__main__":
-    main()
+def simple_keyword_counts(text, keywords=None):
+    # 한국어 형태소 분석을 쓰지 않고 간단 키워드 카운트 (문장에 따라 충분)
+    if keywords is None:
+        keywords = ['폭염','교실','학생','학습권','건강','창가','점심','체육','단축','바다','내륙','온도']
+    lowered = text.replace('\n',' ').lower()
+    counts = {k: lowered.count(k) for k in keywords}
+    dfk = pd.DataFrame({"키워드":list(counts.keys()), "빈도":list(counts.values())})
+    dfk = dfk.sort_values('빈도', ascending=False).reset_index(drop=True)
+    return dfk
+
+kw_df = simple_keyword_counts(USER_TEXT)
+fig_kw = px.bar(kw_df, x='키워드', y='빈도', title="키워드 빈도 (간단 카운트)", labels={'빈도':'빈도수','키워드':'키워드'})
+st.plotly_chart(fig_kw, use_container_width=True)
+
+# 간단 텍스트 요약(핵심 문장 추출) - rule-based: 첫 문장 + 결론문
+st.subheader("간단 요약 (자동 생성)")
+lines = [ln.strip() for ln in USER_TEXT.strip().split('\n') if ln.strip()]
+summary = ""
+if lines:
+    summary = lines[0]
+    if len(lines) > 1:
+        summary += " ... " + lines[-1]
+st.info(summary)
+
+# 사용자 입력 기반 추천 지표 (예시)
+st.subheader("권장 지표 (학교 관점)")
+st.write("- 교실 실내온도(시계열): 수업 시간대별 측정 권장")
+st.write("- 학생 체감(건강) 지표: 두통/졸림/집중저하 발생률 조사")
+st.write("- 대체 수업/단축수업 발생 빈도: 폭염일수와의 상관분석")
+
+# 사용자 입력 전처리 표 다운로드 (텍스트를 표로 변환한 예시)
+st.subheader("사용자 입력 전처리 표 (다운로드)")
+user_table = pd.DataFrame({
+    '원문구분':['본문'],
+    '텍스트길이': [len(USER_TEXT)],
+    '주요키워드': [", ".join(kw_df[kw_df['빈도']>0]['키워드'].tolist())],
+    '출처링크':[USER_LINK]
+})
+st.dataframe(user_table)
+st.download_button("사용자 입력 전처리 CSV 다운로드", data=user_table.to_csv(index=False).encode('utf-8'), file_name='user_input_preprocessed.csv', mime='text/csv')
+
+# ---------------------------
+# 마무리 / 참고문헌
+# ---------------------------
+st.markdown("---")
+st.subheader("참고 및 데이터 출처")
+st.markdown("""
+- NASA GISS GISTEMP (GLB.Ts+dSST.csv) — Global Land-Ocean Temperature Index (monthly & annual).  
+  URL: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv  
+  (코드에서 자동 다운로드 시도 — 실패 시 예시 데이터로 대체됩니다.)
+- NOAA Climate at a Glance / OISST 등 — 추가 분석시 활용 가능. (예: https://www.ncei.noaa.gov)
+""")
+
+st.caption("앱 구현 규칙: date / value / group 표준화, 결측 처리, 미래 데이터(오늘 이후) 제거, @st.cache_data 사용, CSV 다운로드 제공.")
