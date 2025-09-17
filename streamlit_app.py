@@ -120,10 +120,16 @@ with col1:
         y_col = 'value_sm'
     else:
         y_col = 'value'
-    if viz_type=="꺾은선":
-        fig = px.line(df_plot, x='date', y=y_col, labels={'date':'날짜','value':'이상값(°C)'})
+
+    # 날짜별 평균값 (중복 월/연도 제거용)
+    df_plot = df_plot.groupby('date', as_index=False)[y_col].mean()
+
+    if viz_type == "꺾은선":
+        fig = px.line(df_plot, x='date', y=y_col,
+                      labels={'date':'날짜', y_col:'이상값(°C)'})
     else:
-        fig = px.area(df_plot, x='date', y=y_col, labels={'date':'날짜','value':'이상값(°C)'})
+        fig = px.area(df_plot, x='date', y=y_col,
+                      labels={'date':'날짜', y_col:'이상값(°C)'})
     st.plotly_chart(fig, use_container_width=True)
 
 st.download_button("CSV 다운로드", gistemp_df.to_csv(index=False).encode('utf-8'),
