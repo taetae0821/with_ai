@@ -7,8 +7,7 @@ from datetime import datetime, timezone, timedelta
 import plotly.express as px
 
 st.set_page_config(page_title="폭염 대시보드", layout="wide")
-st.title("🌡️ 폭염 — 공개 데이터 시계열")
-st.caption("NASA GISTEMP 공개 데이터를 사용하며, 연결 실패 시 예시 데이터를 사용합니다.")
+st.title("🌡️ 폭염 — 월별 기온 이상값 시계열")
 
 # 오늘 날짜 (Asia/Seoul 기준)
 def local_midnight_today():
@@ -69,10 +68,10 @@ load_result = load_gistemp()
 if not load_result["ok"]:
     st.warning("공개 데이터 다운로드 실패 → 예시 데이터 사용\n오류: " + load_result.get("error","알 수 없음"))
 
-df_plot = load_result["df"]
+df_plot = load_result["df"].sort_values('date').reset_index(drop=True)
 
 # 그래프 옵션
-st.subheader("NASA GISTEMP — 월별 기온 이상값 시계열")
+st.subheader("월별 기온 이상값 시계열")
 col1, col2 = st.columns([3,1])
 with col2:
     rolling = st.selectbox("스무딩(개월)", [1,3,6,12], index=1)
@@ -85,14 +84,9 @@ with col1:
     else:
         y_col = 'value'
 
-    # 기본 월별 표시
-    x_col = 'date'
-
     if viz_type=="꺾은선":
-        fig = px.line(df_plot_vis, x=x_col, y=y_col,
-                      labels={x_col:'날짜', y_col:'이상값(°C)'})
+        fig = px.line(df_plot_vis, x='date', y=y_col, labels={'date':'날짜', y_col:'이상값(°C)'})
     else:
-        fig = px.area(df_plot_vis, x=x_col, y=y_col,
-                      labels={x_col:'날짜', y_col:'이상값(°C)'})
+        fig = px.area(df_plot_vis, x='date', y=y_col, labels={'date':'날짜', y_col:'이상값(°C)'})
 
     st.plotly_chart(fig, use_container_width=True)
