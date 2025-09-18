@@ -1,32 +1,13 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-import io
-from datetime import datetime, timezone, timedelta
-import plotly.express as px
-
-st.set_page_config(page_title="폭염 대시보드", layout="wide")
-st.title("🌡️ 폭염 — 월별 기온 이상값 시계열")
-
-# 오늘 날짜 (Asia/Seoul 기준)
-def local_midnight_today():
-    tz_offset = 9
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-    local_now = now_utc + timedelta(hours=tz_offset)
-    local_midnight = datetime(year=local_now.year, month=local_now.month, day=local_now.day)
-    return local_midnight - timedelta(hours=tz_offset)
-LOCAL_MIDNIGHT_UTC = local_midnight_today()
-
-# 공개 데이터 로드
+# ----- 공개 데이터(GISTEMP) 로드 ----- 
 GISTEMP_CSV_URL = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
 
-@st.cache_data(ttl=60*60*6)
+@st.cache_data(ttl=60*60*6, show_spinner=False)
 def load_gistemp(url=GISTEMP_CSV_URL, timeout=10):
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         text = resp.text
+
         df = pd.read_csv(io.StringIO(text), skiprows=1)
         if 'Year' not in df.columns:
             df = df.rename(columns={df.columns[0]: 'Year'})
@@ -46,47 +27,25 @@ def load_gistemp(url=GISTEMP_CSV_URL, timeout=10):
             df_melt['date'] = pd.to_datetime(df_melt['Year'].astype(str) + '-' + df_melt['month_num'].astype(str) + '-01')
             df_melt['anom'] = pd.to_numeric(df_melt['anom'].astype(str).str.replace('*',''), errors='coerce')
             df_final = df_melt[['date','anom']].rename(columns={'anom':'value'})
+            df_final['group'] = 'GISTEMP월별'
         else:
             df2 = df[['Year','J-D']].copy()
             df2['date'] = pd.to_datetime(df2['Year'].astype(str) + '-01-01')
             df2['value'] = pd.to_numeric(df2['J-D'], errors='coerce')
             df_final = df2[['date','value']].copy()
+            df_final['group'] = 'GISTEMP연간'
 
         df_final = df_final.drop_duplicates(subset=['date'])
         df_final = df_final[df_final['date'] < LOCAL_MIDNIGHT_UTC]
-        return {"ok": True, "df": df_final}
+        return {"ok": True, "df": df_final, "source": url}
+
     except Exception as e:
-        # 예시 데이터
+        # 예시 데이터 생성
         example_dates = pd.date_range(end=(LOCAL_MIDNIGHT_UTC - pd.Timedelta(days=1)), periods=60, freq='M')
         ex_df = pd.DataFrame({
             'date': example_dates,
-            'value': np.linspace(0.2, 1.2, len(example_dates)) + np.random.normal(scale=0.05, size=len(example_dates))
+            'value': np.linspace(0.2, 1.2, len(example_dates)) + np.random.normal(scale=0.05, size=len(example_dates)),
+            'group': '예시_GISTEMP'
         })
-        return {"ok": False, "df": ex_df, "error": str(e)}
-
-load_result = load_gistemp()
-if not load_result["ok"]:
-    st.warning("공개 데이터 다운로드 실패 → 예시 데이터 사용\n오류: " + load_result.get("error","알 수 없음"))
-
-df_plot = load_result["df"].sort_values('date').reset_index(drop=True)
-
-# 그래프 옵션
-st.subheader("월별 기온 이상값 시계열")
-col1, col2 = st.columns([3,1])
-with col2:
-    rolling = st.selectbox("스무딩(개월)", [1,3,6,12], index=1)
-    viz_type = st.selectbox("그래프 유형", ["꺾은선","면적"], index=0)
-with col1:
-    df_plot_vis = df_plot.copy()
-    if rolling > 1:
-        df_plot_vis['value_sm'] = df_plot_vis['value'].rolling(window=rolling, min_periods=1).mean()
-        y_col = 'value_sm'
-    else:
-        y_col = 'value'
-
-    if viz_type=="꺾은선":
-        fig = px.line(df_plot_vis, x='date', y=y_col, labels={'date':'날짜', y_col:'이상값(°C)'})
-    else:
-        fig = px.area(df_plot_vis, x='date', y=y_col, labels={'date':'날짜', y_col:'이상값(°C)'})
-
-    st.plotly_chart(fig, use_container_width=True)
+        # 실패 메시지 반환
+        return {"ok": False, "df": ex_df, "error": str(e), "source": url}
